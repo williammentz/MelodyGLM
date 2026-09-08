@@ -1,0 +1,12 @@
+[project]
+name = "melodyglm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "jsonargparse>=4.52.0",
+    "lightning>=2.6.5",
+    "miditoolkit>=1.0.1",
+    "torch>=2.14.0",
+]
