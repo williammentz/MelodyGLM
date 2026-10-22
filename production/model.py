@@ -550,53 +550,111 @@ class MelodyGLM(nn.Module):
         top_k: int = 0,
         top_p: float = 1.0,
         temperature: float = 1.0,
-    ) -> torch.Tensor:
+        return_generated_ids: bool = False,
+    ):
         batch_size, _, _ = input_ids.shape
         device = input_ids.device
-        assert batch_size == 1, "Only support batch size of 1 for prediction for now"
+
+        assert batch_size == 1, (
+            "Only support batch size of 1 for prediction for now"
+        )
 
         if self.sep_token_tensor.device != device:
             self.sep_token_tensor = self.sep_token_tensor.to(device)
 
         while input_ids.shape[1] < max_length:
-            seq_len = input_ids.shape[1]
-            logits = self(input_ids, attention_kind="prefix", source_length=source_length)
+            logits = self(
+                input_ids,
+                attention_kind="prefix",
+                source_length=source_length,
+            )
 
             sampled_tokens = []
+
             for logit in logits:
-                # Decode according to the sampling strategy
                 sampled_token = self.top_k_top_p_sample(
-                    logit[:, -1, :], top_k=top_k, top_p=top_p, temperature=temperature
+                    logit[:, -1, :],
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
                 )[0]
+
                 sampled_tokens.append(sampled_token)
-            sampled_tokens = torch.cat(sampled_tokens, dim=-1)
 
-            # token = self.tokenizer.convert_id_to_token(sampled_tokens.cpu().numpy())
-            # print(token)
+            sampled_tokens = torch.cat(
+                sampled_tokens,
+                dim=-1,
+            )
 
-            # until <SEP> token is predicted
-            if torch.all(sampled_tokens == self.sep_token_tensor):
-                break
-            # or until the first bar of future part is reached
-            if (
-                future_start_bar is not None
-                and future_start_bar <= sampled_tokens[self.bar_field_index] <= self.bar_vocab_size
+            # Stop when <SEP> is generated.
+            if torch.all(
+                sampled_tokens == self.sep_token_tensor
             ):
                 break
 
-            # Append the sampled token to the input
-            input_ids = torch.cat([input_ids, sampled_tokens.unsqueeze(0).unsqueeze(0)], dim=1)
+            # Stop when generation reaches the future section.
+            if (
+                future_start_bar is not None
+                and
+                future_start_bar
+                <= sampled_tokens[self.bar_field_index]
+                < self.bar_vocab_size
+            ):
+                break
 
-        # Rearrange the sequence to the original order
-        input_ids = torch.cat(
+            input_ids = torch.cat(
+                [
+                    input_ids,
+                    sampled_tokens
+                    .unsqueeze(0)
+                    .unsqueeze(0),
+                ],
+                dim=1,
+            )
+
+        # The original inpainting input is:
+        #
+        # left + [lMASK] + right + <SEP>
+        #
+        # source_length + 1 is therefore the position immediately
+        # after the original <SEP>. Everything appended after that
+        # is material actually sampled by MelodyGLM.
+        generated_ids = (
+            input_ids[
+                :,
+                source_length + 1:,
+                :
+            ]
+            .clone()
+        )
+
+        # Restore musical order:
+        #
+        # left + generated + right + <SEP>
+        output_ids = torch.cat(
             [
-                input_ids[:, :mask_token_position, :],
-                input_ids[:, source_length + 1 :, :],
-                input_ids[:, mask_token_position + 1 : source_length + 1, :],
+                input_ids[
+                    :,
+                    :mask_token_position,
+                    :
+                ],
+
+                generated_ids,
+
+                input_ids[
+                    :,
+                    mask_token_position + 1:
+                    source_length + 1,
+                    :
+                ],
             ],
             dim=1,
         )
-        return input_ids
+
+        if return_generated_ids:
+            return output_ids, generated_ids
+
+        return output_ids
 
     def complete_melody(
         self,
@@ -632,94 +690,244 @@ class MelodyGLM(nn.Module):
         # Predict for melody completion
         self.eval()
         with torch.no_grad():
+
             output_ids = self.predict_for_completion(
+
                 input_ids,
+
                 max_length=max_length,
+
                 max_bar_length=max_bar_length,
+
                 top_k=top_k,
+
                 top_p=top_p,
+
                 temperature=temperature,
+
             )
 
-        midi_file = self.tokenizer.decode(output_ids[0].cpu().numpy())
+        midi_file = self.tokenizer.decode(
+
+            output_ids[0].cpu().numpy()
+
+        )
+
         return midi_file
 
     def inpaint_melody(
         self,
-        prompt_midi_file: Union[str, BinaryIO],
-        bar_range: Optional[Tuple[int, int]] = None,
-        note_range: Optional[Tuple[int, int]] = None,
+        prompt_midi_file: Union[
+            str,
+            BinaryIO,
+        ],
+        bar_range: Optional[
+            Tuple[int, int]
+        ] = None,
+        note_range: Optional[
+            Tuple[int, int]
+        ] = None,
         max_length: int = 512,
         top_k: int = 0,
         top_p: float = 1.0,
         temperature: float = 1.0,
-    ) -> MidiFile:
+        return_generated_midi: bool = False,
+    ):
         """
-        Inpaint a melody from a prompt MIDI file with missing bars or notes.
-        Args:
-            prompt_midi_file: The path to the prompt MIDI file.
-            bar_range: The range of bars to inpaint. (Either bar_range or note_range should be provided.)
-            note_range: The range of notes to inpaint. (Either bar_range or note_range should be provided.)
-            max_length: The maximum length of the generated sequence.
-            top_k: The number of highest probability vocabulary tokens to keep for top-k sampling, optional.
-            top_p: The cumulative probability of highest probability vocabulary tokens to keep for top-p sampling, optional.
-            temperature: The temperature used to scale the logits, optional.
-        Returns:
-            The generated MIDI file.
-        """
-        if (bar_range is None) and (note_range is None) or (bar_range is not None) and (note_range is not None):
-            raise ValueError("Either bar_range or note_range should be provided, but not both")
+        Inpaint a melody from a prompt MIDI file.
 
-        midi_file = MidiFile(prompt_midi_file)
-        assert len(midi_file.instruments) == 1, "Only support single track midi file for now"
+        If return_generated_midi=True, return:
+
+            (full_inpainted_midi, generated_only_midi)
+
+        where generated_only_midi contains only tokens sampled
+        by MelodyGLM for the masked span.
+        """
+
+        if (
+            (bar_range is None and note_range is None)
+            or
+            (
+                bar_range is not None
+                and note_range is not None
+            )
+        ):
+            raise ValueError(
+                "Either bar_range or note_range should "
+                "be provided, but not both"
+            )
+
+        midi_file = MidiFile(
+            prompt_midi_file
+        )
+
+        assert len(midi_file.instruments) == 1, (
+            "Only support single track midi file for now"
+        )
+
         notes = midi_file.instruments[0].notes
 
-        # Crop midi file according to the given range
         if bar_range is not None:
-            note_bar = [note.start // self.tokenizer.ticks_per_bar for note in notes]
-            assert 0 <= bar_range[0] < bar_range[1] <= max(note_bar) + 1, "Invalid bar range"
-            start_note = next(index for index, bar in enumerate(note_bar) if bar >= bar_range[0])
-            end_note = next((index for index, bar in enumerate(note_bar) if bar >= bar_range[1]), len(notes))
-        elif note_range is not None:
-            assert 0 <= note_range[0] < note_range[1] <= len(notes), "Invalid note range"
+            note_bar = [
+                note.start
+                // self.tokenizer.ticks_per_bar
+                for note in notes
+            ]
+
+            assert (
+                0
+                <= bar_range[0]
+                < bar_range[1]
+                <= max(note_bar) + 1
+            ), "Invalid bar range"
+
+            start_note = next(
+                index
+                for index, bar in enumerate(note_bar)
+                if bar >= bar_range[0]
+            )
+
+            end_note = next(
+                (
+                    index
+                    for index, bar in enumerate(note_bar)
+                    if bar >= bar_range[1]
+                ),
+                len(notes),
+            )
+
+        else:
+            assert note_range is not None
+
+            assert (
+                0
+                <= note_range[0]
+                < note_range[1]
+                <= len(notes)
+            ), "Invalid note range"
+
             start_note, end_note = note_range
 
-        midi_file.instruments[0].notes = notes[:start_note] + notes[end_note:]
-        token_ids, note_map = self.tokenizer.encode(midi_file)
+        # Remove the material that MelodyGLM will replace.
+        midi_file.instruments[0].notes = (
+            notes[:start_note]
+            + notes[end_note:]
+        )
 
-        # Split index is the index of the first token of the middle part
-        split_index = note_map["start"][start_note] if start_note < len(note_map) else len(token_ids)
+        token_ids, note_map = (
+            self.tokenizer.encode(
+                midi_file
+            )
+        )
+
+        # First token belonging to the preserved future context.
+        if start_note < len(note_map):
+            split_index = int(
+                note_map["start"][start_note]
+            )
+        else:
+            split_index = len(token_ids)
+
         source_length = len(token_ids) + 1
         mask_token_position = split_index
-        future_start_bar = token_ids[split_index, self.bar_field_index] if start_note < len(note_map) else None
-        # Insert a [longMASK] token
+
+        if start_note < len(note_map):
+            future_start_bar = token_ids[
+                split_index,
+                self.bar_field_index,
+            ]
+        else:
+            future_start_bar = None
+
+        # Construct:
+        #
+        # left + [lMASK] + right + <SEP>
         token_ids = np.concatenate(
             [
                 token_ids[:split_index],
-                [self.tokenizer.long_mask_token_ids],
+
+                [
+                    self.tokenizer
+                    .long_mask_token_ids
+                ],
+
                 token_ids[split_index:],
-                [self.tokenizer.sep_token_ids],
+
+                [
+                    self.tokenizer
+                    .sep_token_ids
+                ],
             ],
             axis=0,
         )
-        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
 
-        # Predict for melody completion
+        input_ids = torch.tensor(
+            token_ids,
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(0)
+
         self.eval()
-        with torch.no_grad():
-            output_ids = self.predict_for_inpainting(
-                input_ids,
-                source_length=source_length,
-                mask_token_position=mask_token_position,
-                future_start_bar=future_start_bar,
-                max_length=max_length,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-            )
 
-        midi_file = self.tokenizer.decode(output_ids[0].cpu().numpy())
-        return midi_file
+        with torch.no_grad():
+
+            if return_generated_midi:
+                (
+                    output_ids,
+                    generated_ids,
+                ) = self.predict_for_inpainting(
+                    input_ids,
+                    source_length=source_length,
+                    mask_token_position=(
+                        mask_token_position
+                    ),
+                    future_start_bar=(
+                        future_start_bar
+                    ),
+                    max_length=max_length,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    return_generated_ids=True,
+                )
+
+            else:
+                output_ids = (
+                    self.predict_for_inpainting(
+                        input_ids,
+                        source_length=source_length,
+                        mask_token_position=(
+                            mask_token_position
+                        ),
+                        future_start_bar=(
+                            future_start_bar
+                        ),
+                        max_length=max_length,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                    )
+                )
+
+        full_midi = self.tokenizer.decode(
+            output_ids[0]
+            .cpu()
+            .numpy()
+        )
+
+        if not return_generated_midi:
+            return full_midi
+
+        generated_midi = self.tokenizer.decode(
+            generated_ids[0]
+            .cpu()
+            .numpy()
+        )
+
+        return (
+            full_midi,
+            generated_midi,
+        )
 
     @property
     def device(self) -> torch.device:

@@ -34,7 +34,7 @@ if __name__ == "__main__":
     }
     print(hyperparameters)
 
-    checkpoint = torch.load(args.checkpoint_path)
+    checkpoint = torch.load(args.checkpoint_path, map_location = torch.device("cpu"))
     state_dict = checkpoint["state_dict"]
     for key in list(state_dict):
         new_key = key.replace("melody_pretrain_model.", "")
